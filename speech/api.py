@@ -120,6 +120,7 @@ class Language(str, Enum):
     nospeech = "nospeech"
 
 
+ASR_LANGUAGE = Language(os.getenv("YUMEHA_LANGUAGE", "auto")).value
 DEVICE = os.getenv("YUMEHA_DEVICE", "cuda:0")
 MODEL_DIR = os.getenv(
     "YUMEHA_MODEL",
@@ -130,6 +131,8 @@ logger.info(f"Loading Yumeha model from {MODEL_DIR} on {DEVICE} ...")
 load_start = time.time()
 m, kwargs = SenseVoiceSmall.from_pretrained(model=MODEL_DIR, device=DEVICE)
 m.eval()
+# FunASR may resolve an unavailable requested backend to CPU. Report the loaded device, not the request.
+DEVICE = str(next(m.parameters()).device)
 load_elapsed = time.time() - load_start
 logger.info(f"Model loaded in {load_elapsed:.2f}s")
 
@@ -267,8 +270,11 @@ async def health():
         "app": APP_NAME,
         "model": MODEL_DIR,
         "device": DEVICE,
+        "language": ASR_LANGUAGE,
         "cuda_available": torch.cuda.is_available(),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "xpu_available": bool(getattr(torch, "xpu", None) and torch.xpu.is_available()),
+        "gpu_name": (torch.xpu.get_device_name(torch.device(DEVICE)) if DEVICE.startswith("xpu") else
+                     torch.cuda.get_device_name(torch.device(DEVICE)) if DEVICE.startswith("cuda") else None),
     }
 
 
@@ -276,7 +282,7 @@ async def health():
 async def asr(
     files: Annotated[List[UploadFile], File(description="音频文件")],
     keys: Annotated[Optional[str], Form(description="文件名，逗号分隔")] = None,
-    lang: Annotated[Language, Form(description="语言")] = "auto",
+    lang: Annotated[Language, Form(description="语言")] = ASR_LANGUAGE,
     use_itn: Annotated[bool, Form(description="逆文本正则化")] = True,
 ):
     if not files:
@@ -415,7 +421,7 @@ def _asr_sync(audio_np: np.ndarray) -> Tuple[str, str]:
     tensor = torch.from_numpy(audio_np)
     res = m.inference(
         data_in=[tensor],
-        language="auto",
+        language=ASR_LANGUAGE,
         use_itn=True,
         ban_emo_unk=False,
         key=["dlg"],

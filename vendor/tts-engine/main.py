@@ -36,7 +36,7 @@ Requests are spoken one at a time, in the order they arrive; a request's sentenc
 interleaved with another request's. When a client disconnects, its requests that have not started
 (and the sentences not yet spoken) are dropped.
 
-    python main.py --port 8002 --host 127.0.0.1 [--device auto|cuda|cuda:1|cpu|mps] [--no-half]
+    python main.py --port 8002 --host 127.0.0.1 [--device auto|cuda|cuda:1|cpu|mps|xpu] [--no-half]
 """
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=SERVER_NAME)
     ap.add_argument("--port", type=int, default=8002)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--device", default="auto", help="auto (cuda > mps > cpu), cuda, cuda:N, cpu or mps")
+    ap.add_argument("--device", default="auto", help="auto (cuda > mps > cpu), cuda, cuda:N, cpu, mps or explicit xpu")
     ap.add_argument("--half", action=argparse.BooleanOptionalAction, default=None,
                     help="fp16 inference (default: on for CUDA, off elsewhere)")
     ap.add_argument("--character", default=None, help="speaker to load at start (default: first in Speakers/)")
@@ -952,6 +952,7 @@ class VoiceEngine:
         import torch
         want = (self.args.device or "auto").lower()
         mps = getattr(torch.backends, "mps", None)
+        xpu = getattr(torch, "xpu", None)
         if want == "auto":
             dev = "cuda" if torch.cuda.is_available() else "mps" if (mps and mps.is_available()) else "cpu"
         elif want.startswith("cuda") and not torch.cuda.is_available():
@@ -960,11 +961,18 @@ class VoiceEngine:
         elif want == "mps" and not (mps and mps.is_available()):
             LOG.warning("MPS requested but not available; using CPU")
             dev = "cpu"
+        elif want.startswith("xpu") and not (xpu and xpu.is_available()):
+            LOG.warning("XPU requested but not available; using CPU")
+            dev = "cpu"
         else:
             dev = want
         half = self.args.half if self.args.half is not None else dev.startswith("cuda")
         if dev == "cpu" and half:
             LOG.warning("fp16 is not supported on CPU; using fp32")
+            half = False
+        if dev.startswith("xpu") and half:
+            # The pinned v2ProPlus speaker verifier runs an FFT on half audio; XPU rejects it.
+            LOG.warning("GPT-SoVITS speaker verification needs fp32 on XPU; using fp32")
             half = False
         return dev, bool(half)
 
@@ -977,6 +985,8 @@ class VoiceEngine:
         if self.device.startswith("cuda"):
             idx = torch.device(self.device).index or 0
             self.gpu = torch.cuda.get_device_name(idx)
+        elif self.device.startswith("xpu"):
+            self.gpu = torch.xpu.get_device_name(torch.device(self.device))
         LOG.info("torch %s, device %s%s, %s", torch.__version__, self.device, f" ({self.gpu})" if self.gpu else "",
                  "fp16" if self.half else "fp32")
         with _Quiet(self.args.verbose) as q:

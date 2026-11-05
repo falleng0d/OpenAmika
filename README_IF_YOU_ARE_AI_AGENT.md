@@ -534,6 +534,15 @@ first; it turns green and the browser opens when it answers (`launch.py --no-bro
 - **CPU only**: `powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1 --cpu` and
   `envs\brain\Scripts\python.exe scripts\setup_tts.py --cpu`; `settings.json` then has `speech_device: "cpu"`, the
   embedder on `cpu` / `fp32`, vision off. Slow, but complete.
+- **Intel XPU (experimental, explicit opt-in)**: on Windows 11 / Core Ultra 9 285H / Arc 140T, isolated official
+  `torch==2.10.0+xpu` + `torchaudio==2.10.0+xpu` environments successfully ran the production SenseVoiceSmall
+  path (`speech_device: "xpu"`, fp32) and bge-m3 (`embedder.device: "xpu"`, fp32 or fp16). Only speech recognition
+  improved the measured short-request service latency; keep embeddings and TTS on CPU on this machine unless new
+  measurements justify switching. Preserve working CPU environments: install XPU wheels from
+  `https://download.pytorch.org/whl/xpu` in a separate environment, then point only the verified service's interpreter
+  at it. The setup scripts do not install/select XPU automatically. TTS `--device xpu` uses fp32 and falls back to CPU
+  if XPU is unavailable; `auto` remains CUDA → MPS → CPU. Its pinned speaker verifier cannot run half-precision FFTs
+  on XPU, so `--half` is downgraded with a warning. See [the voice server's Intel notes](vendor/tts-engine/README.md#intel-xpu-experimental-not-automatically-selected).
 - **Your own environments** (conda or other): create them yourself (Python 3.11; the speech, embed and vision ones
   need a CUDA torch first: `pip install torch==2.10.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128`
   for speech, `torch==2.10.0` for the embedder, `torch==2.10.0 torchvision==0.25.0` for vision; then their

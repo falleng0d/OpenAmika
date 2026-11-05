@@ -33,6 +33,16 @@ def example_cfg(tmp_path):
     return cfg
 
 
+@pytest.mark.parametrize("language", [None, "en"])
+def test_speech_recognition_language_reaches_child_environment(language):
+    cfg = json.loads((ROOT / "settings.example.json").read_text("utf-8"))
+    cfg.pop("speech_language", None)
+    if language is not None:
+        cfg["speech_language"] = language
+    speech = next(service for service in launch.core_services(cfg, None, None) if service.name == "speech")
+    assert speech.env["YUMEHA_LANGUAGE"] == (language or "auto")
+
+
 @pytest.fixture()
 def fresh(tmp_path, monkeypatch):
     """launch.py looking at an empty checkout: no environments, no voice, no models."""

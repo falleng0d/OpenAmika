@@ -7,6 +7,7 @@
   "messengers_port": 5215,
   "local_model_url": "http://127.0.0.1:11434/v1/chat/completions",
   "speech_device": "cuda:0",
+  "speech_language": "auto",
   "tts_url": "http://127.0.0.1:8002",
   "tts_character": "MekaHime_Amika",
   "embedder": {

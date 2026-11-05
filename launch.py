@@ -1381,6 +1381,7 @@ def core_services(cfg, emb, vis):
                AMIKA_LOCAL_MODEL_URL=cfg['local_model_url'],
                YUMEHA_HOST='127.0.0.1', YUMEHA_PORT=str(ports[1]),
                YUMEHA_MODEL=str(ROOT / 'speech/models'), YUMEHA_DEVICE=cfg['speech_device'],
+               YUMEHA_LANGUAGE=cfg.get('speech_language', 'auto'),
                AMIKA_TTS_URL=cfg['tts_url'], AMIKA_TTS_CHARACTER=cfg['tts_character'],
                AMIKA_MESSENGERS_PORT=str(messengers_port(cfg)), AMIKA_MESSENGERS_URL=texts)
     if emb:
