@@ -1,7 +1,7 @@
 # speech/ — the speech gateway
 
-`speech/api.py` (FastAPI) is the part of OpenAmika your browser talks to. It runs the local speech recognition
-(**SenseVoiceSmall** with Silero VAD and barge-in), streams the brain's replies through the shared output parser,
+`speech/api.py` (FastAPI) is the part of OpenAmika your browser talks to. It runs speech recognition
+(local **SenseVoiceSmall** by default, or optional **OpenRouter**; Silero VAD and barge-in stay local), streams the brain's replies through the shared output parser,
 splits them into sentences, sends each sentence to her voice server (`vendor/tts-engine`, or any server that
 speaks `docs/TTS.md`), and serves every web page. `launch.py` starts
 it in the speech environment; it binds to 127.0.0.1.
@@ -24,6 +24,10 @@ it in the speech environment; it binds to 127.0.0.1.
 | `YUMEHA_HOST` / `YUMEHA_PORT` | `127.0.0.1` / `53000` | bind address and port (`chat_port`) |
 | `YUMEHA_DEVICE` | `cuda:0` | STT device (`speech_device`); `cpu` works, slower |
 | `YUMEHA_MODEL` | `speech/models` | SenseVoiceSmall folder |
+| `AMIKA_STT_BACKEND` | `local` | `speech_backend`: `local` or `openrouter` |
+| `AMIKA_STT_MODEL` | `microsoft/mai-transcribe-2` | `speech_openrouter_model`: OpenRouter STT model ID |
+| `AMIKA_STT_TIMEOUT_S` | `30` | `speech_timeout_s`: remote request timeout; no automatic retries |
+| `OPENROUTER_STT_API_KEY` | shared OpenRouter key | optional dedicated speech key in `brain/.env`; launcher supplies it only to speech |
 | `HANE_URL` | `http://127.0.0.1:5202` | the brain |
 | `AMIKA_TTS_URL` / `AMIKA_TTS_CHARACTER` | `http://127.0.0.1:8002` / `MekaHime_Amika` | the voice server and voice id |
 | `AMIKA_VLM_URL` | empty (vision off) | the optional vision service |
@@ -39,9 +43,29 @@ it in the speech environment; it binds to 127.0.0.1.
 - `/api/avatar/*`, `/api/stage*`: Live2D models from `avatar/models/` and the stage backdrop.
 - `/api/voice_map*`, `/api/tts_probe`, `/api/tts_say`, `/api/name_pronunciation`: voice settings.
 
+## Optional remote transcription
+
+In `settings.json`, set `"speech_backend": "openrouter"` and restart the stack. The default remote model is
+`microsoft/mai-transcribe-2`; `speech_openrouter_model` can instead select another OpenRouter transcription model
+(for example `elevenlabs/scribe-v2` or `mistralai/voxtral-small-transcribe-3-0`). Put a dedicated
+`OPENROUTER_STT_API_KEY` in the git-ignored `brain/.env`, or reuse its existing `OPENROUTER_API_KEY`.
+When starting `speech/api.py` directly, supply those environment variables yourself.
+
+The microphone still streams to this gateway continuously. **Only buffered utterances are uploaded to OpenRouter**
+after the existing end-of-speech pause (about 500 ms with the brain connected, 900 ms without it), at the 30-second
+utterance limit, or on an explicit stop. Short pauses do not trigger remote partial transcription or speculative
+AI generation. Resuming speech while a request is pending cancels/discards that result; the next completed utterance
+includes the earlier audio, so the provider may bill overlapping audio in that case. VAD continues while normal
+end-of-speech requests run. Remote failures are shown in chat; there is no silent backend switch or paid retry.
+Remote results have plain text, not SenseVoice's emotion/event tags. Audio leaves your machine in remote mode.
+
+To go back to fully local recognition, set `"speech_backend": "local"` and restart. SenseVoice and its existing
+partial/speculative behavior are unchanged. Remote mode does not load or require SenseVoice weights; Silero VAD
+still runs locally. `/health` reports `backend`, `model`, and `device` (`remote` for OpenRouter).
+
 ### Plain speech recognition: `POST /api/v1/asr`
 
-The gateway also exposes SenseVoiceSmall as a simple API (multipart/form-data):
+The gateway exposes the selected transcription backend as a simple API (multipart/form-data):
 
 | field | required | default | |
 |---|---|---|---|
@@ -49,6 +73,9 @@ The gateway also exposes SenseVoiceSmall as a simple API (multipart/form-data):
 | `lang` | no | `auto` | `auto`, `zh`, `en`, `yue`, `ja`, `ko` |
 | `use_itn` | no | `true` | inverse text normalisation (punctuation) |
 | `keys` | no | file names | comma-separated ids for the results |
+
+In remote mode, each file is sent to OpenRouter after local decoding/resampling; `use_itn` is local-only.
+The response shape stays the same; remote `text`, `clean_text`, and `raw_text` all contain plain transcription text.
 
 ```bash
 curl -X POST http://127.0.0.1:53000/api/v1/asr -F "files=@audio.wav" -F "lang=auto"

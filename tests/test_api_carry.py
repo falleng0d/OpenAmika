@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import unittest
+from unittest.mock import patch
 import uuid
 from collections import deque
 from datetime import datetime
@@ -24,6 +25,7 @@ if not ROOT.is_dir():
     ROOT = Path(__file__).resolve().parents[1] / "speech"   # repo layout
 sys.path.insert(0, str(ROOT))
 import stt_carry  # noqa: E402
+import stt_openrouter  # noqa: E402
 
 SRC = (ROOT / "api.py").read_text(encoding="utf-8")
 _TREE = ast.parse(SRC)
@@ -156,6 +158,7 @@ NS = dict(asyncio=asyncio, time=time, uuid=uuid, base64=base64, re=re, np=np, de
           socketio=_SocketIO, SurfaceSpeechExtractor=_Extractor, DeepSpeechExtractor=_Extractor,
           StreamingSplitter=_Splitter, stt_carry=stt_carry, apply_wordmap=lambda t, w: t,
           logger=logging.getLogger("test_api_carry"), WebSocket=object, HANE_URL="x", TTS_URL="y",
+          TTS_TRANSPORT="local", TTS_REQUEST_TIMEOUT_S=240, STT_BACKEND="local", stt_openrouter=stt_openrouter,
           TTS_CHARACTER_ID="c", TTS_AUDIO_FORMAT="wav", prefix_emotion=lambda *a, **k: "",
           parse_sfx_delta=lambda *a, **k: None, resolve_sfx=lambda *a, **k: None, pause_after=lambda *a, **k: 0.0,
           # vision hooks (speech/api.py vision section) are no-ops here
@@ -191,6 +194,166 @@ async def force_commit(s, n=938):
 
 def run(coro):
     return asyncio.run(coro)
+
+
+class RemoteTranscriptionTests(unittest.TestCase):
+    def test_remote_upload_waits_for_the_completed_utterance_and_skips_partials(self):
+        async def main():
+            calls = []
+
+            async def recognize(audio):
+                calls.append(audio.copy())
+                return "This is the complete sentence.", "This is the complete sentence."
+
+            with patch.dict(NS, STT_BACKEND="openrouter", _asr_async=recognize):
+                s = new_session()
+                await frames(s, 10, 0.1)       # idle silence never reaches recognition
+                await frames(s, 10, 0.9)
+                await frames(s, 3, 0.1)        # short pause, no remote partial
+                await frames(s, 5, 0.9)
+                self.assertEqual(calls, [])
+                await frames(s, s.long_pause_frames, 0.1)
+                task = s._pending_commit
+                if task is not None:
+                    await task
+                self.assertEqual(len(calls), 1)
+                # Six pre-roll frames, both speech sections, and both pauses are retained.
+                self.assertEqual(len(calls[0]), (6 + 10 + 3 + 5 + s.long_pause_frames) * 512)
+                self.assertEqual([m[1] for m in msgs(s)], ["This is the complete sentence."])
+                self.assertFalse(any(m["type"] == "partial" for m in s.ws.sent))
+                await frames(s, 50, 0.1)
+                await s.force_stop()           # do not charge again for an already committed utterance
+                self.assertEqual(len(calls), 1)
+        run(main())
+
+    def test_resumed_speech_cancels_pending_upload_and_discards_a_stale_result(self):
+        async def main():
+            entered = asyncio.Event()
+            calls = []
+
+            async def recognize(audio):
+                calls.append(len(audio))
+                if len(calls) == 1:
+                    entered.set()
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        return "Stale result must not reach the brain.", "stale"
+                return "The complete continued sentence.", "The complete continued sentence."
+
+            with patch.dict(NS, STT_BACKEND="openrouter", _asr_async=recognize):
+                s = new_session()
+                await frames(s, 10, 0.9)
+                await frames(s, s.long_pause_frames, 0.1)
+                await entered.wait()
+                pending = s._pending_commit
+                # This must finish while recognition is still pending: VAD is not blocked by the network.
+                await frames(s, 5, 0.9)
+                await pending
+                self.assertEqual(msgs(s), [])
+                await frames(s, s.long_pause_frames, 0.1)
+                pending = s._pending_commit
+                if pending is not None:
+                    await pending
+                self.assertGreater(calls[1], calls[0])
+                self.assertEqual([m[1] for m in msgs(s)], ["The complete continued sentence."])
+        run(main())
+
+    def test_remote_failure_is_visible_and_the_next_utterance_can_succeed(self):
+        async def main():
+            calls = []
+
+            async def recognize(audio):
+                calls.append(len(audio))
+                if len(calls) == 1:
+                    raise stt_openrouter.TranscriptionError("OpenRouter transcription failed (HTTP 402).")
+                return "The second utterance succeeds.", "The second utterance succeeds."
+
+            with patch.dict(NS, STT_BACKEND="openrouter", _asr_async=recognize):
+                s = new_session()
+                await frames(s, 5, 0.9)
+                await frames(s, s.long_pause_frames, 0.1)
+                task = s._pending_commit
+                if task is not None:
+                    await task
+                self.assertEqual(s._state, "IDLE")
+                self.assertEqual(msgs(s), [])
+                self.assertIn({"type": "ai_error", "message": "OpenRouter transcription failed (HTTP 402)."}, s.ws.sent)
+                await frames(s, 5, 0.9)
+                await frames(s, s.long_pause_frames, 0.1)
+                task = s._pending_commit
+                if task is not None:
+                    await task
+                self.assertEqual([m[1] for m in msgs(s)], ["The second utterance succeeds."])
+        run(main())
+
+    def test_remote_force_cut_preserves_carry_and_explicit_stop_transcribes(self):
+        async def main():
+            with patch.dict(NS, STT_BACKEND="openrouter"):
+                s = new_session()
+                s.MAX_UTTERANCE_SEC = 0.2
+                await frames(s, 7, 0.9)
+                self.assertEqual(s._state, "IDLE")
+                self.assertEqual(s._carry_text, "spoken words across 7 frames")
+                await frames(s, 3, 0.9)
+                await s.force_stop()
+                self.assertEqual(msgs(s)[-1][1], "spoken words across 7 frames spoken words across 3 frames")
+        run(main())
+
+    def test_remote_commit_recovers_when_brain_disconnects_before_protect(self):
+        async def main():
+            calls = []
+
+            async def recognize(audio):
+                calls.append(audio.copy())
+                return "A completed utterance.", "A completed utterance."
+
+            with patch.dict(NS, STT_BACKEND="openrouter", _asr_async=recognize):
+                s = new_session()
+                await frames(s, 10, 0.9)
+                s._speech_frames[0] = np.full(512, 0.4, dtype=np.float32)
+                await frames(s, s.long_pause_frames, 0.1)
+                task = s._pending_commit
+                if task is not None:
+                    await task
+                self.assertEqual(s._state, "POST_COMMIT")
+                s.hane._connected = False
+                await frames(s, 1100, 0.1)       # >30 seconds without a protect acknowledgement
+                self.assertEqual(s._state, "IDLE")
+                self.assertEqual(len(s._speech_frames), 0)
+                self.assertEqual(len(calls), 1)  # recovery must not retranscribe silence
+                s.hane._connected = True
+                await frames(s, 5, 0.9)
+                await frames(s, s.long_pause_frames, 0.1)
+                task = s._pending_commit
+                if task is not None:
+                    await task
+                self.assertEqual(len(calls), 2)
+                self.assertGreater(calls[0].max(), 0)
+                self.assertEqual(calls[1].max(), 0)  # the old utterance is not submitted again
+        run(main())
+
+    def test_reset_cancels_pending_remote_work_without_publishing_it(self):
+        async def main():
+            entered = asyncio.Event()
+
+            async def recognize(audio):
+                entered.set()
+                await asyncio.Future()
+
+            with patch.dict(NS, STT_BACKEND="openrouter", _asr_async=recognize):
+                s = new_session()
+                await frames(s, 5, 0.9)
+                await frames(s, s.long_pause_frames, 0.1)
+                await entered.wait()
+                pending = s._pending_commit
+                s._reset_utterance()
+                await asyncio.gather(pending, return_exceptions=True)
+                self.assertTrue(pending.cancelled())
+                self.assertEqual(msgs(s), [])
+                self.assertIsNone(s._pending_commit)
+                self.assertEqual(s._state, "IDLE")
+        run(main())
 
 
 class CarryLifecycleTests(unittest.TestCase):

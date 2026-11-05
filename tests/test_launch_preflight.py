@@ -33,6 +33,47 @@ def example_cfg(tmp_path):
     return cfg
 
 
+@pytest.mark.parametrize("language", [None, "en"])
+def test_speech_recognition_language_reaches_child_environment(language):
+    cfg = json.loads((ROOT / "settings.example.json").read_text("utf-8"))
+    cfg.pop("speech_language", None)
+    if language is not None:
+        cfg["speech_language"] = language
+    speech = next(service for service in launch.core_services(cfg, None, None) if service.name == "speech")
+    assert speech.env["YUMEHA_LANGUAGE"] == (language or "auto")
+
+
+@pytest.mark.parametrize("transport", [None, "modal"])
+def test_voice_transport_and_cloud_budget_reach_gateway(transport):
+    cfg = json.loads((ROOT / "settings.example.json").read_text("utf-8"))
+    cfg.pop("tts_transport", None)
+    cfg.pop("tts_timeout_s", None)
+    if transport is not None:
+        cfg.update(tts_transport=transport, tts_timeout_s=210)
+    speech = next(service for service in launch.core_services(cfg, None, None) if service.name == "speech")
+    assert speech.env["AMIKA_TTS_TRANSPORT"] == (transport or "local")
+    assert speech.env["AMIKA_TTS_TIMEOUT_S"] == ("210" if transport else "240")
+
+
+@pytest.mark.parametrize("dedicated", [True, False])
+def test_remote_transcription_key_and_settings_reach_only_the_speech_child(tmp_path, monkeypatch, dedicated):
+    monkeypatch.setattr(launch, "ROOT", tmp_path)
+    for key in ("OPENROUTER_API_KEY", "OPENROUTER_STT_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    (tmp_path / "brain").mkdir()
+    (tmp_path / "brain/.env").write_text("OPENROUTER_API_KEY=shared-test-key\n" + (
+        "OPENROUTER_STT_API_KEY=speech-test-key\n" if dedicated else ""), "utf-8")
+    cfg = json.loads((ROOT / "settings.example.json").read_text("utf-8"))
+    cfg.update(speech_backend="openrouter", speech_openrouter_model="elevenlabs/scribe-v2", speech_timeout_s=17)
+    services = launch.core_services(cfg, None, None)
+    speech = next(s for s in services if s.name == "speech")
+    assert speech.env["OPENROUTER_STT_API_KEY"] == ("speech-test-key" if dedicated else "shared-test-key")
+    assert (speech.env["AMIKA_STT_BACKEND"], speech.env["AMIKA_STT_MODEL"], speech.env["AMIKA_STT_TIMEOUT_S"]) == (
+        "openrouter", "elevenlabs/scribe-v2", "17",
+    )
+    assert all("OPENROUTER_STT_API_KEY" not in s.env for s in services if s.name != "speech")
+
+
 @pytest.fixture()
 def fresh(tmp_path, monkeypatch):
     """launch.py looking at an empty checkout: no environments, no voice, no models."""
@@ -103,6 +144,23 @@ def test_a_missing_key_is_a_warning_the_wizard_can_fix(fresh, monkeypatch):
     cfg, (services, held, agents) = services_for(example_cfg(fresh), fresh / "vendor" / "tts-engine")
     got = checks(launch.preflight(cfg, None, None, None, None, services, agents, [], held_iot=held))
     assert got["API keys"][0] == "warn" and "wizard" in got["API keys"][1]
+
+
+def test_remote_mode_does_not_require_sensevoice_but_requires_a_key(fresh, monkeypatch):
+    monkeypatch.setattr(launch, "ROOT", fresh)
+    for key in ("OPENROUTER_API_KEY", "OPENROUTER_STT_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    (fresh / "config").mkdir()
+    (fresh / "config/word_replace.json").write_text("{}", "utf-8")
+    cfg, (services, held, agents) = services_for(example_cfg(fresh), fresh / "vendor/tts-engine")
+    cfg["speech_backend"] = "openrouter"
+    got = checks(launch.preflight(cfg, None, None, None, None, services, agents, [], held_iot=held))
+    assert got["required files"] == ("ok", "all present")
+    assert got["speech backend"][0] == "err"
+    monkeypatch.setenv("OPENROUTER_STT_API_KEY", "test-key-never-log-this")
+    got = checks(launch.preflight(cfg, None, None, None, None, services, agents, [], held_iot=held))
+    assert got["speech backend"][0] == "ok"
+    assert "test-key-never-log-this" not in str(got)
 
 
 def install_voice(engine, clips=2, missing_clip=False):

@@ -369,10 +369,10 @@ def list_processes():
 
 
 def listeners():
-    """port -> pid for every listening TCP port (Windows), else {}."""
+    """Port -> PID for listeners that can conflict with our IPv4 loopback services."""
     if os.name != 'nt':
         return {}
-    script = 'Get-NetTCPConnection -State Listen | Select-Object LocalPort,OwningProcess | ConvertTo-Json -Compress'
+    script = 'Get-NetTCPConnection -State Listen | Select-Object LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress'
     try:
         out = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True, text=True,
                              timeout=30, creationflags=NO_WINDOW).stdout
@@ -381,7 +381,12 @@ def listeners():
         return {}
     if isinstance(data, dict):
         data = [data]
-    return {int(d['LocalPort']): int(d['OwningProcess']) for d in data if isinstance(d, dict) and d.get('LocalPort')}
+    taken = {}
+    # Prefer the IPv4 listener if a dual-stack wildcard and loopback share a port.
+    for d in sorted((row for row in data if isinstance(row, dict)), key=lambda row: row.get('LocalAddress') != '::'):
+        if d.get('LocalPort') and d.get('LocalAddress') in ('127.0.0.1', '0.0.0.0', '::', '::ffff:127.0.0.1'):
+            taken[int(d['LocalPort'])] = int(d['OwningProcess'])
+    return taken
 
 
 _CLOSE = {'services': [], 'handler': None}
@@ -1361,12 +1366,23 @@ def preflight(cfg, emb, vis, tools, tools_error, services, agents, procs, deep=F
         report.add('ok' if Path(python).is_file() else 'err', label, python if Path(python).is_file() else
                    f'missing: {python} — run {SETUP_CORE} (or fix the path in settings.json)')
     local_only = roles_all_local()
-    needed = ['speech/models/model.pt', 'config/word_replace.json'] + (['brain/embed_server.py'] if emb else [])
+    speech_backend = cfg.get('speech_backend', 'local').strip().lower()
+    needed = ['config/word_replace.json'] + (['brain/embed_server.py'] if emb else [])
+    if speech_backend == 'local':
+        needed.append('speech/models/model.pt')
     hints = {'speech/models/model.pt': f'speech recognition model (SenseVoiceSmall, ~940 MB): run {SETUP_CORE}'}
     missing = [p for p in needed if not (ROOT / p).is_file()]
     report.add('ok' if not missing else 'err', 'required files',
                'all present' if not missing else ', '.join(f'{p} ({hints.get(p, "missing")})' for p in missing))
     env = read_env(ROOT / 'brain' / '.env')
+    if speech_backend == 'openrouter':
+        stt_key = (os.environ.get('OPENROUTER_STT_API_KEY') or env.get('OPENROUTER_STT_API_KEY')
+                   or os.environ.get('OPENROUTER_API_KEY') or env.get('OPENROUTER_API_KEY'))
+        report.add('ok' if stt_key else 'err', 'speech backend',
+                   f"OpenRouter · {cfg.get('speech_openrouter_model', 'microsoft/mai-transcribe-2')} (local VAD)" if stt_key
+                   else 'OpenRouter transcription needs OPENROUTER_STT_API_KEY (or OPENROUTER_API_KEY) in brain/.env')
+    elif speech_backend != 'local':
+        report.add('err', 'speech backend', 'speech_backend must be local or openrouter in settings.json')
     key = env.get('OPENROUTER_API_KEY', '')
     if key and not key.startswith('sk-or-v1-your'):
         others = [k for k in ('DASHSCOPE_API_KEY', 'GEMINI_API_KEY', 'GROQ_API_KEY', 'CEREBRAS_API_KEY', 'ANTHROPIC_API_KEY') if env.get(k)]
@@ -1504,7 +1520,7 @@ def preflight(cfg, emb, vis, tools, tools_error, services, agents, procs, deep=F
             except Exception as error:
                 report.add('err', f'{key} imports', f'could not run: {error}')
         for label, block, cmd in (('embedder check', emb, ['brain/embed_server.py', '--check', '--model', (emb or {}).get('model', '')]),
-                                  ('vision check', vis, ['vision/vlm_service.py', '--check'])):
+                                  ('vision check', vis, ['vision/vlm_service.py', '--check', '--device', (vis or {}).get('device', 'cuda')])):
             if not block or not Path(block['python']).is_file():
                 continue                              # off, or its python row already says it is missing
             try:
@@ -1991,7 +2007,13 @@ def core_services(cfg, emb, vis):
                AMIKA_LOCAL_MODEL_URL=cfg['local_model_url'],
                YUMEHA_HOST='127.0.0.1', YUMEHA_PORT=str(ports[1]),
                YUMEHA_MODEL=str(ROOT / 'speech/models'), YUMEHA_DEVICE=cfg['speech_device'],
+                YUMEHA_LANGUAGE=cfg.get('speech_language', 'auto'),
+                AMIKA_STT_BACKEND=cfg.get('speech_backend', 'local'),
+                AMIKA_STT_MODEL=cfg.get('speech_openrouter_model', 'microsoft/mai-transcribe-2'),
+                AMIKA_STT_TIMEOUT_S=str(cfg.get('speech_timeout_s', 30)),
                AMIKA_TTS_URL=cfg['tts_url'], AMIKA_TTS_CHARACTER=cfg['tts_character'],
+               AMIKA_TTS_TRANSPORT=cfg.get('tts_transport', 'local'),
+               AMIKA_TTS_TIMEOUT_S=str(cfg.get('tts_timeout_s', 240)),
                AMIKA_MESSENGERS_PORT=str(messengers_port(cfg)), AMIKA_MESSENGERS_URL=texts,
                AMIKA_PET_PYTHON=sys.executable)     # the Use page's "Desktop pet" button: the Python of --pet
     if emb:
@@ -2017,7 +2039,12 @@ def core_services(cfg, emb, vis):
                                       '--device', vis.get('device', 'cuda')],
                            cwd=ROOT / 'vision', env=env, health=f"http://127.0.0.1:{int(vis['port'])}/api/health", expect_ok=True,
                            timeout=int(vis.get('load_timeout_s', 300)), kind='core', url=f"http://127.0.0.1:{int(vis['port'])}"))
-    out.append(Service('speech', [cfg['speech_python'], '-u', str(ROOT / 'speech/api.py')], cwd=ROOT / 'speech', env=env,
+    speech_env = dict(env)
+    if cfg.get('speech_backend', 'local').strip().lower() == 'openrouter':
+        secrets = read_env(ROOT / 'brain' / '.env')
+        speech_env['OPENROUTER_STT_API_KEY'] = (os.environ.get('OPENROUTER_STT_API_KEY') or secrets.get('OPENROUTER_STT_API_KEY')
+                                               or os.environ.get('OPENROUTER_API_KEY') or secrets.get('OPENROUTER_API_KEY', ''))
+    out.append(Service('speech', [cfg['speech_python'], '-u', str(ROOT / 'speech/api.py')], cwd=ROOT / 'speech', env=speech_env,
                        health=f'http://127.0.0.1:{ports[1]}/health', expect_app=True, timeout=90, kind='core',
                        url=f'http://localhost:{ports[1]}'))
     # text channels (Discord / Telegram bots): its light says which bots are online, or that none is set up yet

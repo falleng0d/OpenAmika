@@ -137,7 +137,8 @@ Environment variables `launch.py` passes to the core (from `settings.json`): `HA
 `AMIKA_MESSENGERS_PORT` / `AMIKA_MESSENGERS_URL` (`messengers_port`), `AMIKA_EMBEDDING_URL` (with an `embedder`
 block), `AMIKA_VLM_URL` (with vision on).
 
-**A voice turn**: mic PCM (browser) → `WS /ws/dialog` → Silero VAD + SenseVoiceSmall STT (speech) → brain
+**A voice turn**: mic PCM (browser) → `WS /ws/dialog` → local Silero VAD + STT (SenseVoiceSmall by default;
+optional OpenRouter completed-utterance transcription via `speech_backend`, see `speech/README.md`) → brain
 `message` → surface four-liner (spoken at once) → deep stream → `speech/hane_parser.py`
 splits `[emotion]"sentence"` runs → one TTS request per sentence (`tts_request_gateway`, text `【happy2】.sentence`,
 after the `llm_to_tts` word map and `speech/tts_text.py`: shouting lower-cased, dashes → commas, ellipses → full
@@ -431,7 +432,8 @@ Done. Next:  .\Start_OpenAmika.bat   (or double-click it: her voice server start
 
 ### 5.4 Her brain's LLM
 
-Her ears, voice, memory and eyes always run on the PC; the four LLM roles (§1) run one of two ways. Recommend the
+Her voice, memory, eyes and VAD run on the PC; transcription is local by default or optionally OpenRouter
+(`speech/README.md`). The four LLM roles (§1) run one of two ways. Recommend the
 first: in almost all cases it is the better setup, and it costs a few dollars a month.
 
 - **Semi-Local (the default, recommended)**: the roles run on OpenRouter with the person's own key and the models
@@ -650,6 +652,15 @@ ledger's open rows retired); a port held by something that does not answer like 
 - **CPU only**: `powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1 --cpu` and
   `envs\brain\Scripts\python.exe scripts\setup_tts.py --cpu`; `settings.json` then has `speech_device: "cpu"`, the
   embedder on `cpu` / `fp32`, vision off. Slow, but complete.
+- **Intel XPU (experimental, explicit opt-in)**: on Windows 11 / Core Ultra 9 285H / Arc 140T, isolated official
+  `torch==2.10.0+xpu` + `torchaudio==2.10.0+xpu` environments successfully ran the production SenseVoiceSmall
+  path (`speech_device: "xpu"`, fp32) and bge-m3 (`embedder.device: "xpu"`, fp32 or fp16). Only speech recognition
+  improved the measured short-request service latency; keep embeddings and TTS on CPU on this machine unless new
+  measurements justify switching. Preserve working CPU environments: install XPU wheels from
+  `https://download.pytorch.org/whl/xpu` in a separate environment, then point only the verified service's interpreter
+  at it. The setup scripts do not install/select XPU automatically. TTS `--device xpu` uses fp32 and falls back to CPU
+  if XPU is unavailable; `auto` remains CUDA → MPS → CPU. Its pinned speaker verifier cannot run half-precision FFTs
+  on XPU, so `--half` is downgraded with a warning. See [the voice server's Intel notes](vendor/tts-engine/README.md#intel-xpu-experimental-not-automatically-selected).
 - **Your own environments** (conda or other): create them yourself (Python 3.11; the speech, embed and vision ones
   need a CUDA torch first: `pip install torch==2.10.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu128`
   for speech, `torch==2.10.0` for the embedder, `torch==2.10.0 torchvision==0.25.0` for vision; then their
@@ -717,7 +728,8 @@ adds), the file is left with conflict markers and is not JSON any more.
 | `services.tts` | enabled; `vendor\tts-engine\.venv\Scripts\python.exe main.py --port 8002 --host 127.0.0.1 --character MekaHime_Amika` in `vendor\tts-engine`; health `http://127.0.0.1:8002/ping`; timeout 240 s | started by the launcher; keep `--character` equal to `tts_character` |
 | `services.mqtt`, `services.zigbee2mqtt` | disabled | the smart home (§8; the person enables them) |
 
-**`brain/.env`** (from `.env.example`; secrets only): `OPENROUTER_API_KEY` (the default provider of all four roles;
+**`brain/.env`** (from `.env.example`; secrets only): optional `OPENROUTER_STT_API_KEY` for remote transcription
+(falls back to the shared key), `OPENROUTER_API_KEY` (the default provider of all four roles;
 not needed when every role is on Ollama); optional `DASHSCOPE_API_KEY` / `DASHSCOPE_BASE_URL` (Alibaba Model Studio,
 workspace in `config/alibaba_models.json`), `GEMINI_API_KEY` (legacy embedder), `GROQ_API_KEY`, `CEREBRAS_API_KEY`,
 `XAI_API_KEY`, `ANTHROPIC_API_KEY` (legacy direct providers, off by default).

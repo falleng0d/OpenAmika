@@ -253,7 +253,8 @@
     // speech / STT
     try {
       const h = await getJSON("/health");
-      add(h.cuda_available ? "ok" : "warn", "Speech / STT", h.cuda_available ? (h.gpu_name || "cuda") : "running on CPU (slow)");
+      if (h.backend === "openrouter") add("ok", "Speech / STT", "OpenRouter · " + h.model + " · local VAD");
+      else add(h.cuda_available ? "ok" : "warn", "Speech / STT", h.cuda_available ? (h.gpu_name || "cuda") : "running on CPU (slow)");
     } catch (_) { add("err", "Speech / STT", "gateway not answering"); }
     // TTS
     try {

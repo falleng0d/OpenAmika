@@ -64,6 +64,25 @@ Any other voice is yours to bring: a speaker folder in `vendor/tts-engine/Speake
 `tts_url` at it and describe it under `services.tts` (command, cwd, health URL) so the launcher starts it with
 the rest.
 
+## Private Modal voice backend
+
+See [`servers/modal-tts/README.md`](../servers/modal-tts/README.md) for deploying the private GPU worker and
+loopback Socket.IO bridge. Set `tts_transport` to `modal` only when `services.tts` launches that bridge.
+The browser still talks only to localhost; credentials stay in the bridge's Modal SDK profile, not in settings
+or browser messages. Transcription, memory, avatar rendering and the OpenRouter brain remain unchanged.
+
+The gateway waits for the bridge's actual GPU readiness before opening the cloud-backed dialog. Passive local
+health requests do not keep a GPU alive. After an idle scale-down, synthesis can incur a new cold start; Modal
+requests therefore use a separate bounded `tts_timeout_s` budget (default 240 seconds, outside the bridge's
+180-second RPC budget). Initial asset/model readiness has a separate 900-second limit. The local backend's
+original 2-second first-audio and 5-second in-flight timers are unchanged. Cloud mode does not invoke the local
+first-audio fallback that clears the queue; it protects the turn when real audio arrives. An expired cloud
+request reports `tts_error`, and late results still cannot replace a newer turn or sentence.
+
+Model files are fetched from their official source directly into a private cloud volume. Personal assets and
+credentials are not uploaded from this checkout or baked into the container image. Modal's RPC retention
+policy applies to spoken-text inputs and generated-audio outputs; use this only for your personal voice backend.
+
 ## Emotion vocabularies: internal vs. old-style voices
 
 - **Internal (V2)**: 69 `register_emotion` keys (`casual_happy`, `whisper_caring`, …). This is the

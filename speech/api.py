@@ -29,8 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from typing_extensions import Annotated
 
-from model import SenseVoiceSmall
-from funasr.utils.postprocess_utils import rich_transcription_postprocess
+import stt_openrouter
 from sentence_splitter import StreamingSplitter
 from hane_parser import SurfaceSpeechExtractor, DeepSpeechExtractor
 import stt_carry
@@ -131,18 +130,38 @@ class Language(str, Enum):
     nospeech = "nospeech"
 
 
+ASR_LANGUAGE = Language(os.getenv("YUMEHA_LANGUAGE", "auto")).value
+STT_BACKEND = os.getenv("AMIKA_STT_BACKEND", "local").strip().lower()
+STT_MODEL = os.getenv("AMIKA_STT_MODEL", "microsoft/mai-transcribe-2").strip()
+STT_TIMEOUT_S = float(os.getenv("AMIKA_STT_TIMEOUT_S", "30"))
+STT_API_KEY = os.getenv("OPENROUTER_STT_API_KEY", "").strip() or os.getenv("OPENROUTER_API_KEY", "").strip()
+if STT_BACKEND not in ("local", "openrouter"):
+    raise RuntimeError("AMIKA_STT_BACKEND must be local or openrouter.")
+if STT_TIMEOUT_S <= 0 or not np.isfinite(STT_TIMEOUT_S):
+    raise RuntimeError("AMIKA_STT_TIMEOUT_S must be a positive, finite number.")
+if STT_BACKEND == "openrouter" and (not STT_API_KEY or not STT_MODEL):
+    raise RuntimeError("OpenRouter transcription requires an API key and AMIKA_STT_MODEL.")
 DEVICE = os.getenv("YUMEHA_DEVICE", "cuda:0")
 MODEL_DIR = os.getenv(
     "YUMEHA_MODEL",
     os.path.join(os.path.dirname(__file__), "models"),
 )
 
-logger.info(f"Loading the speech recognition model (SenseVoiceSmall) from {MODEL_DIR} on {DEVICE} ...")
-load_start = time.time()
-m, kwargs = SenseVoiceSmall.from_pretrained(model=MODEL_DIR, device=DEVICE)
-m.eval()
-load_elapsed = time.time() - load_start
-logger.info(f"Speech recognition model loaded in {load_elapsed:.2f}s")
+if STT_BACKEND == "local":
+    from model import SenseVoiceSmall
+    from funasr.utils.postprocess_utils import rich_transcription_postprocess
+
+    logger.info(f"Loading the speech recognition model (SenseVoiceSmall) from {MODEL_DIR} on {DEVICE} ...")
+    load_start = time.time()
+    m, kwargs = SenseVoiceSmall.from_pretrained(model=MODEL_DIR, device=DEVICE)
+    m.eval()
+    # FunASR may resolve an unavailable requested backend to CPU. Report the loaded device, not the request.
+    DEVICE = str(next(m.parameters()).device)
+    load_elapsed = time.time() - load_start
+    logger.info(f"Speech recognition model loaded in {load_elapsed:.2f}s")
+else:
+    DEVICE = "remote"
+    logger.info(f"STT: OpenRouter ({STT_MODEL}); local VAD, completed utterances only")
 
 logger.info("Loading Silero VAD ...")
 _vad_load_start = time.time()
@@ -279,10 +298,14 @@ async def health():
     return {
         "status": "ok",
         "app": APP_NAME,
-        "model": MODEL_DIR,
+        "backend": STT_BACKEND,
+        "model": STT_MODEL if STT_BACKEND == "openrouter" else MODEL_DIR,
         "device": DEVICE,
+        "language": ASR_LANGUAGE,
         "cuda_available": torch.cuda.is_available(),
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "xpu_available": bool(getattr(torch, "xpu", None) and torch.xpu.is_available()),
+        "gpu_name": (torch.xpu.get_device_name(torch.device(DEVICE)) if DEVICE.startswith("xpu") else
+                     torch.cuda.get_device_name(torch.device(DEVICE)) if DEVICE.startswith("cuda") else None),
     }
 
 
@@ -290,7 +313,7 @@ async def health():
 async def asr(
     files: Annotated[List[UploadFile], File(description="audio files")],
     keys: Annotated[Optional[str], Form(description="a name for each file, comma-separated")] = None,
-    lang: Annotated[Language, Form(description="language (auto detects it)")] = "auto",
+    lang: Annotated[Language, Form(description="language (auto detects it)")] = ASR_LANGUAGE,
     use_itn: Annotated[bool, Form(description="inverse text normalization: numbers and punctuation as written")] = True,
 ):
     if not files:
@@ -328,8 +351,26 @@ async def asr(
         key = [f.filename for f in files]
     else:
         key = keys.split(",")
+    if len(key) != len(audios):
+        raise HTTPException(status_code=400, detail="Provide one key per audio file.")
 
     inference_start = time.time()
+    if STT_BACKEND == "openrouter":
+        try:
+            transcripts = []
+            for audio, name in zip(audios, key):
+                text, raw = await stt_openrouter.transcribe(
+                    audio.numpy(), api_key=STT_API_KEY, model=STT_MODEL,
+                    language=lang, timeout_s=STT_TIMEOUT_S,
+                )
+                transcripts.append({"key": name, "text": text, "clean_text": text, "raw_text": raw})
+        except stt_openrouter.TranscriptionError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from None
+        return {"result": transcripts, "meta": {
+            "inference_time": round(time.time() - inference_start, 3),
+            "total_time": round(time.time() - request_start, 3),
+            "audio_duration": round(sum(audio_lengths), 2),
+        }}
     try:
         res = m.inference(
             data_in=audios,
@@ -429,7 +470,7 @@ def _asr_sync(audio_np: np.ndarray) -> Tuple[str, str]:
     tensor = torch.from_numpy(audio_np)
     res = m.inference(
         data_in=[tensor],
-        language="auto",
+        language=ASR_LANGUAGE,
         use_itn=True,
         ban_emo_unk=False,
         key=["dlg"],
@@ -444,6 +485,11 @@ def _asr_sync(audio_np: np.ndarray) -> Tuple[str, str]:
 
 
 async def _asr_async(audio_np: np.ndarray) -> Tuple[str, str]:
+    if STT_BACKEND == "openrouter":
+        return await stt_openrouter.transcribe(
+            audio_np, api_key=STT_API_KEY, model=STT_MODEL,
+            language=ASR_LANGUAGE, timeout_s=STT_TIMEOUT_S,
+        )
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _asr_sync, audio_np)
 
@@ -466,6 +512,7 @@ def _build_f_session_busy(session):
         getattr(session, "_connecting", False) or getattr(session, "_input_busy", False)
         or session._state in ("SPEAKING", "SHORT_PAUSE")
         or (pending is not None and not pending.done())
+        or (getattr(session, "_pending_commit", None) is not None and not session._pending_commit.done())
         or (session._committed_turn_id is not None and not session._ai_end_received)
         or session._tts_playing is not None or session._tts_inflight is not None
         or session._tts_sentence_queue or session._tts_pending_play
@@ -1492,6 +1539,12 @@ class HaneClient:
 # ---------------------------- TTS 对接 ---------------------------- #
 
 TTS_URL = os.getenv("AMIKA_TTS_URL", "http://127.0.0.1:8002")
+TTS_TRANSPORT = os.getenv("AMIKA_TTS_TRANSPORT", "local")
+TTS_REQUEST_TIMEOUT_S = float(os.getenv("AMIKA_TTS_TIMEOUT_S", "240"))
+if TTS_TRANSPORT not in ("local", "modal"):
+    raise ValueError("AMIKA_TTS_TRANSPORT must be local or modal")
+if not 0 < TTS_REQUEST_TIMEOUT_S <= 900:
+    raise ValueError("AMIKA_TTS_TIMEOUT_S must be greater than 0 and at most 900")
 # Shipping policy: V1 (old-vocabulary) voices only — the voice adapter is on by default
 # and swaps character_id per request, so this value is the adapter-OFF fallback.
 TTS_CHARACTER_ID = os.getenv("AMIKA_TTS_CHARACTER", "MekaHime_Amika")
@@ -1516,6 +1569,8 @@ class TTSClient:
     def __init__(self, session: "DialogSession"):
         self.session = session
         self.url = TTS_URL
+        self.transport = TTS_TRANSPORT
+        self.request_timeout_s = TTS_REQUEST_TIMEOUT_S
         self.sio = socketio.AsyncClient(
             reconnection=True, reconnection_attempts=0,
             logger=False, engineio_logger=False,
@@ -1525,6 +1580,18 @@ class TTSClient:
 
     async def connect(self):
         try:
+            if self.transport == "modal":
+                # The bridge binds immediately, but its private GPU may still be loading/warming.
+                # Do not admit a cloud-backed conversation until real readiness, not just TCP-up.
+                async with asyncio.timeout(900):
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as client:
+                        while True:
+                            async with client.get(self.url.rstrip("/") + "/ping", allow_redirects=False) as response:
+                                if response.status == 200:
+                                    break
+                                if await response.text() == "error":
+                                    raise RuntimeError("Cloud voice bridge failed to initialize")
+                            await asyncio.sleep(1)
             await self.sio.connect(self.url, transports=["websocket"])
             self._connected = True
             logger.info(f"[tts] connected to {self.url}")
@@ -2799,6 +2866,7 @@ class DialogSession:
         self._asr_seq = 0
         self._active_asr_seq = 0
         self._pending_partial: Optional[asyncio.Task] = None
+        self._pending_commit: Optional[asyncio.Task] = None
         # IDLE 时的滚动缓冲：开口那一刻把它塞到 speech_frames 前面
         pad_frames = max(1, int(self.PRE_SPEECH_PAD_MS / self.FRAME_MS))
         self._pre_buffer: deque = deque(maxlen=pad_frames)
@@ -2957,6 +3025,7 @@ class DialogSession:
         return len(self._speech_frames)
 
     def _reset_utterance(self):
+        self._cancel_remote_commit()
         self._speech_frames = []
         self._silence_frames = 0
         self._state = "IDLE"
@@ -2972,6 +3041,42 @@ class DialogSession:
         self._my_partial_lang = None
         self._interrupt_probe_start_ms = None
         self._probe_frames = []
+
+    def _cancel_remote_commit(self):
+        task = self._pending_commit
+        if task is not None:
+            self._asr_seq += 1
+            self._active_asr_seq = self._asr_seq
+            if task is not asyncio.current_task():
+                task.cancel()
+            self._pending_commit = None
+
+    def _start_remote_commit(self):
+        # Snapshot before yielding; keep receiving PCM/VAD while the request is in flight.
+        audio = np.concatenate(self._speech_frames)
+        self._last_commit_text = ""
+        self._asr_seq += 1
+        self._active_asr_seq = self._asr_seq
+        self._pending_commit = asyncio.create_task(self._commit_remote(audio, self._asr_seq))
+
+    async def _commit_remote(self, audio: np.ndarray, seq: int, cut_ms: Optional[int] = None):
+        try:
+            text, raw = await _asr_async(audio)
+            if seq != self._active_asr_seq:
+                return
+            if _is_trivial_utterance(text) and self._my_partial_pending is None:
+                text = ""
+            self._last_commit_text = text or ""
+            await self._commit_transcript(text, raw, cut_ms, _now_ms())
+            if not text or not self._ai_pipeline_online:
+                self._reset_utterance()
+        except stt_openrouter.TranscriptionError as error:
+            if seq == self._active_asr_seq:
+                await self._send({"type": "ai_error", "message": str(error)})
+                self._reset_utterance()
+        finally:
+            if self._pending_commit is asyncio.current_task():
+                self._pending_commit = None
 
     async def _send(self, obj: dict):
         try:
@@ -3002,6 +3107,8 @@ class DialogSession:
             is_speech = prob >= self.VAD_NEG_THRESHOLD
 
         if is_speech:
+            if STT_BACKEND == "openrouter":
+                self._cancel_remote_commit()
             if self._state == "IDLE":
                 # AI 正在说话时，真打断要经过"迟到确认"门控：
                 # 先攒 0.4s 探针，期间短暂爆发（咳嗽/清嗓）直接吃掉；过了 0.4s 仍在
@@ -3110,7 +3217,8 @@ class DialogSession:
                     self._state = "SHORT_PAUSE"
                     trigger_ms = _now_ms()
                     self._last_trigger_ms = trigger_ms
-                    self._pending_partial = asyncio.create_task(self._do_partial(trigger_ms))
+                    if STT_BACKEND == "local":
+                        self._pending_partial = asyncio.create_task(self._do_partial(trigger_ms))
             elif self._state == "SHORT_PAUSE":
                 # 继续累积音频（含中间静音）。用户若再开口，整段会是连续的录音，
                 # ASR 能拿到完整上下文；当前 utterance 一直延伸，直到长停顿才 commit。
@@ -3118,8 +3226,11 @@ class DialogSession:
                 self._silence_frames += 1
                 if self._silence_frames >= self.long_pause_frames:
                     online = self._ai_pipeline_online
-                    await self._do_commit()
-                    if online:
+                    if STT_BACKEND == "openrouter":
+                        self._start_remote_commit()
+                    else:
+                        await self._do_commit()
+                    if online or STT_BACKEND == "openrouter":
                         # 在线：长停顿 = commit 信号（告诉前端/TTS 本轮定稿），
                         # 但**不**切音频。音频分界点交给 protect。
                         self._state = "POST_COMMIT"
@@ -3137,6 +3248,8 @@ class DialogSession:
         # （例如 Hane/TTS 故障导致 protect 永远不来）。
         if self.utterance_frames * self.FRAME_MS / 1000 > self.MAX_UTTERANCE_SEC:
             logger.warning(f"[dlg {self._peer}] utterance too long, force commit")
+            if self._pending_commit is not None:
+                await self._pending_commit
             if self._state != "POST_COMMIT":
                 if self._state == "SPEAKING":
                     # Build F: the last finished partial does not cover speech after the
@@ -3164,7 +3277,7 @@ class DialogSession:
         """trigger_ms 是 VAD 判定进入 SHORT_PAUSE 的时间戳（ms, epoch），
         用于前端显示端到端延迟。
         """
-        if not self._speech_frames:
+        if STT_BACKEND != "local" or not self._speech_frames:
             return
         self._asr_seq += 1
         seq = self._asr_seq
@@ -3245,6 +3358,17 @@ class DialogSession:
         """
         if not self._speech_frames:
             return
+        if STT_BACKEND == "openrouter":
+            if self._pending_commit is not None:
+                await self._pending_commit
+                return
+            if self._state == "POST_COMMIT" and self._last_commit_text:
+                return
+            self._last_commit_text = ""
+            self._asr_seq += 1
+            self._active_asr_seq = self._asr_seq
+            await self._commit_remote(np.concatenate(self._speech_frames), self._asr_seq, cut_ms)
+            return
         # 等待最近一次 partial 的 ASR 跑完（通常已完成，这里是保险）
         pending = self._pending_partial
         if pending is not None and not pending.done():
@@ -3306,6 +3430,10 @@ class DialogSession:
             if text and self._duplicate_commit(text):
                 text = ""
 
+        await self._commit_transcript(text, raw, cut_ms, fresh_transcript_ms)
+
+    async def _commit_transcript(self, text: str, raw: str, cut_ms: Optional[int],
+                                 transcript_ms: Optional[int]):
         if text:
             tid = self._make_turn_id()
             self._committed_turn_id = tid
@@ -3314,7 +3442,7 @@ class DialogSession:
             self._reset_tts_for_new_turn()
             commit_ms = _now_ms()
             self._tl_open_voice_round(tid, commit_ms, reuse=False, cut_ms=cut_ms,
-                                      transcript_ms=fresh_transcript_ms)
+                                      transcript_ms=transcript_ms)
             await self._send({
                 "type": "commit", "text": text, "raw": raw,
                 "turn_id": tid, "ts": commit_ms,
@@ -3759,7 +3887,7 @@ class DialogSession:
             self._tts_inflight_watchdog(task_id, self._committed_turn_id)
         )
         # 超时兜底：1s 内没收到首段音频 → 视为已收到，走 protect + reset，避免卡死
-        if not self._tts_first_audio_sent:
+        if not self._tts_first_audio_sent and self.tts.transport != "modal":
             asyncio.create_task(
                 self._tts_first_audio_watchdog(task_id, self._committed_turn_id)
             )
@@ -4007,10 +4135,19 @@ class DialogSession:
         """每句 TTS 兜底：发出后 TTS_INFLIGHT_TIMEOUT_MS 内既没 audio_ready 也没 error
         回来 → 视为这句丢了，清 inflight 并继续排空队列。否则一句卡死会让 _tts_inflight
         永远非空、"audio busy" 门一直为真，后续 inject（念弹幕 / SC）全被吞。"""
-        await asyncio.sleep(self.TTS_INFLIGHT_TIMEOUT_MS / 1000)
+        timeout_s = self.tts.request_timeout_s if self.tts.transport == "modal" else self.TTS_INFLIGHT_TIMEOUT_MS / 1000
+        await asyncio.sleep(timeout_s)
         inflight = self._tts_inflight
         if inflight is None or inflight.get("task_id") != task_id:
             return                       # 已被 audio_ready / error / reset 消耗
+        if self.tts.transport == "modal":
+            # Cold recovery after scale-to-zero is not a missing local packet. Keep the request
+            # correlated until this explicit cloud budget expires, then surface a real error.
+            await self._on_tts_event("error", {
+                "task_id": task_id, "turn_id": inflight["tts_turn_id"],
+                "error": f"Cloud voice generation timed out after {timeout_s:g}s.",
+            })
+            return
         logger.warning(
             f"[dlg {self._peer}] tts inflight timeout ({self.TTS_INFLIGHT_TIMEOUT_MS}ms) "
             f"idx={inflight.get('idx')} turn={turn_id_at_request} — skip, drain queue"
@@ -4558,7 +4695,11 @@ async def ws_dialog(ws: WebSocket):
         session._input_busy = False
         session._wipe_retired = False
         _dialog_sessions.add(session)
-        await asyncio.gather(session.hane.connect(), session.tts.connect())
+        if TTS_TRANSPORT == "modal":
+            await session.tts.connect()
+            await session.hane.connect()
+        else:
+            await asyncio.gather(session.hane.connect(), session.tts.connect())
         session._connecting = False
         await ws.send_json({"type": "ready", "sample_rate": DialogSession.SAMPLE_RATE,
                             "frame_samples": DialogSession.FRAME_SAMPLES,
@@ -4626,6 +4767,10 @@ async def ws_dialog(ws: WebSocket):
             _dialog_sessions.discard(session)
             if session._pending_partial and not session._pending_partial.done():
                 session._pending_partial.cancel()
+            pending_commit = session._pending_commit
+            session._cancel_remote_commit()
+            if pending_commit is not None:
+                await asyncio.gather(pending_commit, return_exceptions=True)
             on_close = getattr(session, "_tl_on_disconnect", None)
             if on_close is not None:
                 on_close()

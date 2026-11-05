@@ -129,8 +129,8 @@ vendor/tts-engine/.venv/bin/python vendor/tts-engine/main.py --port 8002        
 | flag | default | |
 |---|---|---|
 | `--port` / `--host` | `8002` / `127.0.0.1` | bind address |
-| `--device` | `auto` | `cuda` (or `cuda:N`) when available, then Apple `mps`, then `cpu` |
-| `--half` / `--no-half` | fp16 on CUDA | |
+| `--device` | `auto` | `cuda` (or `cuda:N`) when available, then Apple `mps`, then `cpu`; Intel `xpu` / `xpu:N` requires explicit selection and an XPU torch build |
+| `--half` / `--no-half` | fp16 on CUDA | CPU and XPU use fp32; XPU's pinned speaker verifier cannot run its FFT in fp16 |
 | `--character` | first folder in `Speakers/` | speaker loaded at start; requests for another speaker switch to it |
 | `--ref-max-s` | `15` | longest reference clip used whole, with its transcript (upstream's own limit is 10 s; see below) |
 | `--text-split` | `sentence` | `sentence`: every sentence of a run is its own GPT fragment (see [How it uses upstream](#how-it-uses-upstream)); or one of upstream's split methods for the whole run: `cut0` none, `cut1` every 4 phrases, `cut5` every punctuation mark |
@@ -152,6 +152,25 @@ real-time factor and the language mode used (`lang=en>auto` when an English run 
 below); `/api/health` also lists the settings in use (`text_split`, `batch_size`, `ref_max_s`, `eos_floor`, ...)
 and counts the dropout guard's extra takes under `retries`. Ctrl-C stops the server within about a second, also
 while a client is connected or a synthesis is running.
+
+### Intel XPU: experimental, not automatically selected
+
+Windows 11 / Core Ultra 9 285H / Arc 140T was tested with official PyTorch
+`torch==2.9.1+xpu` and `torchaudio==2.9.1+xpu` from
+`https://download.pytorch.org/whl/xpu`, in a separate environment. Explicit
+`--device xpu --no-half` synthesized repeated English, Japanese and Chinese clips
+with finite, non-silent audio and reproducible fixed-seed output, without changing
+the downloaded GPT-SoVITS source or voice assets. An unavailable XPU falls back to CPU
+at device selection; synthesis failures are reported, not silently retried on another backend.
+
+This is **compatibility evidence, not a TTS speed recommendation**. CPU remained the
+recommended voice backend on that machine; XPU was not consistently faster across
+languages, and first-use kernel compilation was expensive. CUDA graphs and NVIDIA
+FlashAttention are not available on XPU. `--half` is downgraded to fp32 with a warning:
+the pinned v2ProPlus speaker verifier otherwise raises `Unsupported dtype Half` in
+its FFT. A mixed-precision runtime prototype was tested but is deliberately not shipped.
+The installer and `auto` device priority remain unchanged; do not replace a working
+CPU environment merely because XPU is detected.
 
 ## Contract (any server that speaks this works)
 

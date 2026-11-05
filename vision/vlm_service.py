@@ -155,6 +155,33 @@ class SmallVLM:
         return text
 
 
+class ModalVLM:
+    """Same local feed contract, with inference on the private Modal voice worker."""
+
+    def __init__(self, key: str):
+        if key != "qwen3-vl-2b":
+            raise ValueError("Modal vision supports only qwen3-vl-2b")
+        self.key = key
+        self.repo = MODELS[key][0]
+        self.is_loaded = False
+        self.worker = None
+
+    def load(self):
+        import modal
+        self.worker = modal.Cls.from_name("openamika-tts", "Voice")()
+
+    def preprocess(self, image, prompt: str):
+        import io
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85)
+        return output.getvalue(), prompt
+
+    def generate(self, inputs) -> str:
+        description = self.worker.describe.remote(*inputs)
+        self.is_loaded = True
+        return description
+
+
 # ---------------------------------------------------------------------------
 # Shared state + feed subscriber + inference loop (ported, trimmed)
 # ---------------------------------------------------------------------------
@@ -391,7 +418,8 @@ def main():
 
     if args.check:
         import importlib.util
-        names = ("torch", "transformers", "cv2", "PIL", "numpy", "fastapi", "uvicorn", "websocket")
+        names = (("modal", "cv2", "PIL", "numpy", "fastapi", "uvicorn", "websocket") if args.device == "modal"
+                 else ("torch", "transformers", "cv2", "PIL", "numpy", "fastapi", "uvicorn", "websocket"))
         missing = [n for n in names if importlib.util.find_spec(n) is None]
         if missing:
             print(f"vision check: missing modules: {', '.join(missing)}")
@@ -404,7 +432,7 @@ def main():
     from fastapi.responses import JSONResponse
 
     state = State()
-    model = SmallVLM(args.model, device=args.device, max_tokens=args.max_tokens)
+    model = ModalVLM(args.model) if args.device == "modal" else SmallVLM(args.model, device=args.device, max_tokens=args.max_tokens)
     print(f"[vlm] loading {model.repo} …", flush=True)
     t0 = time.time()
     model.load()
@@ -425,8 +453,8 @@ def main():
     @app.get("/api/health")
     def api_health():
         return JSONResponse({
-            "ok": model.is_loaded,
-            "status": "ok" if model.is_loaded else "loading",
+            "ok": model.is_loaded or isinstance(model, ModalVLM),
+            "status": "ok" if model.is_loaded else ("idle" if isinstance(model, ModalVLM) else "loading"),
             "model": args.model,
             "model_loaded": model.is_loaded,
             "running": state.running,

@@ -28,7 +28,8 @@
     // speech
     try {
       const h = await getJSON("/health");
-      add("ok", "Speech / STT", `${h.device || "?"} · cuda ${h.cuda_available ? "✓ " + (h.gpu_name || "") : "✗ (cpu)"}`);
+      add("ok", "Speech / STT", h.backend === "openrouter" ? `OpenRouter · ${h.model} · local VAD`
+        : `${h.device || "?"} · cuda ${h.cuda_available ? "✓ " + (h.gpu_name || "") : "✗ (cpu)"}`);
       setNavDot(1, "ok");
     } catch (error) { add("err", "Speech / STT", String(error.message || error)); setNavDot(1, "err"); }
     // tts

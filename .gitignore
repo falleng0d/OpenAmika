@@ -7,6 +7,8 @@ brain/.env*
 settings.json
 config/tools.json
 config/messengers.json
+.modal.toml
+.modal/
 
 # ── Private runtime data (memories, usage ledger, logs, machine-local state) ──
 memory_f/
@@ -14,8 +16,22 @@ brain/memories/
 backups/
 logs/
 *.log
+*.log.*
+*.pid
 *.sqlite
 *.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+config/build_f.json
+config/word_replace.json
 config/seed.json
 config/ollama.json
 config/voice_map.json
@@ -33,6 +49,20 @@ speech/models/*
 !speech/models/DOWNLOAD.md
 avatar/models/*
 !avatar/models/README.md
+# Protect weights/reference recordings and generated voice clips outside the usual model folders too.
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.onnx
+*.gguf
+*.bin
+*.moc3
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.opus
 
 # ── Third-party stacks you install next to OpenAmika (never part of this repo) ──
 IoT/zigbee2mqtt/
@@ -50,6 +80,15 @@ __pycache__/
 venv/
 .pytest_cache/
 tests/browser/node_modules/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+build/
+dist/
 
 # ── OS / editor noise ────────────────────────────────────────────────
 .DS_Store
